@@ -26,7 +26,7 @@ variable "image_tag" {
 }
 
 variable "secrets" {
-  description = "Map of env var -> SSM parameter name/ARN or Secrets Manager ARN"
+  description = "Map of env var -> SSM Parameter name or ARN"
   type        = map(string)
   default     = {}
 }
@@ -37,11 +37,6 @@ variable "allowed_ssm_parameters" {
   default     = []
 }
 
-variable "allowed_secretsmanager_arns" {
-  description = "List of Secrets Manager secret ARNs the execution role can read. Leave empty to allow * (not recommended for prod)."
-  type        = list(string)
-  default     = []
-}
 
 variable "allowed_kms_keys" {
   description = "List of KMS Key ARNs allowed for decrypt when reading SSM/Secrets. Leave empty to allow * (not recommended for prod)."
@@ -71,9 +66,8 @@ locals {
     }]
   })
 
-  ssm_resources     = length(var.allowed_ssm_parameters) > 0 ? var.allowed_ssm_parameters : ["*"]
-  secrets_resources = length(var.allowed_secretsmanager_arns) > 0 ? var.allowed_secretsmanager_arns : ["*"]
-  kms_resources     = length(var.allowed_kms_keys) > 0 ? var.allowed_kms_keys : ["*"]
+  ssm_resources = length(var.allowed_ssm_parameters) > 0 ? var.allowed_ssm_parameters : ["*"]
+  kms_resources = length(var.allowed_kms_keys) > 0 ? var.allowed_kms_keys : ["*"]
 
   inline_read_secrets = jsonencode({
     Version = "2012-10-17",
@@ -82,10 +76,9 @@ locals {
       Action = [
         "ssm:GetParameters",
         "ssm:GetParameter",
-        "secretsmanager:GetSecretValue",
         "kms:Decrypt"
       ],
-      Resource = concat(local.ssm_resources, local.secrets_resources, local.kms_resources)
+      Resource = concat(local.ssm_resources, local.kms_resources)
     }]
   })
 }
