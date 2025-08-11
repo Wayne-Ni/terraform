@@ -20,9 +20,10 @@ permissions:
 
 jobs:
   build-and-test:
+    environment: ${{ github.ref_name == 'main' && 'prod' || github.ref_name == 'staging' && 'staging' || 'dev' }}
     runs-on: ubuntu-latest
     env:
-      ENV: ${{ github.ref_name == 'main' && 'prod' || github.ref_name == 'staging' && 'staging' || 'dev' }}
+      ENV: ${{ github.ref_name == 'main' && 'prod' || github.ref_name == 'staging' && 'staging' || 'dev' }} 
       ECR_REPO: ${{ github.ref_name == 'main' && 'myapp-prod' || github.ref_name == 'staging' && 'myapp-staging' || 'myapp-dev' }}
 
     steps:
@@ -155,6 +156,13 @@ jobs:
         with:
           terraform_version: 1.7.5
 
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}          
+  
       - name: Terraform Init
         working-directory: ${{ env.TF_DIR }}
         run: terraform init -input=false -no-color
