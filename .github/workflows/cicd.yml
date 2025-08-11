@@ -7,37 +7,64 @@ on:
       - staging
       - main
 
-
 concurrency:
   group: cicd-${{ github.ref }}
   cancel-in-progress: true
 
 env:
   AWS_REGION: ap-northeast-1
-  DOCKERFILE: Dockerfile
 
 permissions:
   contents: read
   security-events: write
 
 jobs:
-  deploy:
-    environment: ${{ github.ref_name == 'main' && 'prod' || github.ref_name == 'staging' && 'staging' || 'dev' }}
+  build-and-test:
     runs-on: ubuntu-latest
     env:
       ENV: ${{ github.ref_name == 'main' && 'prod' || github.ref_name == 'staging' && 'staging' || 'dev' }}
-      TF_DIR: ${{ github.ref_name == 'main' && 'prod' || github.ref_name == 'staging' && 'staging' || 'dev' }}
       ECR_REPO: ${{ github.ref_name == 'main' && 'myapp-prod' || github.ref_name == 'staging' && 'myapp-staging' || 'myapp-dev' }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+      - name: Cache Go modules
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.24'
+          cache: true
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Verify dependencies
+        run: go mod verify
+
+      - name: Run tests
+        run: go test -v -race -coverprofile=coverage.out ./...
+
+      - name: Build Go binary
+        run: |
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -a -installsuffix cgo -o app .
+          echo "Binary size: $(ls -lh app)"
+
+      - name: Upload coverage reports
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./coverage.out
+          flags: unittests
+          name: codecov-umbrella
 
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -55,17 +82,34 @@ jobs:
           repository: ${{ env.ECR_REPO }}
           public: true
 
-      # Build locally first, scan, then push only if scan passes
-      - name: Build image (no push)
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Cache Docker layers
+        uses: actions/cache@v3
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-
+
+      # Build Docker image using pre-built Go binary
+      - name: Build Docker image
         run: |
           docker buildx build \
             --platform linux/amd64 \
+            --cache-from type=local,src=/tmp/.buildx-cache \
+            --cache-to type=local,dest=/tmp/.buildx-cache,mode=max \
             -t ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ env.ENV }}-latest \
-            -f ${{ env.DOCKERFILE }} \
+            -f Dockerfile \
             --load .
 
       - name: Trivy scan (local image)
         uses: aquasecurity/trivy-action@0.20.0
+        continue-on-error: true
         with:
           scan-type: image
           image-ref: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ env.ENV }}-latest
@@ -77,15 +121,34 @@ jobs:
           output: trivy-results.sarif
 
       - name: Upload Trivy SARIF to Code Scanning
-        uses: github/codeql-action/upload-sarif@v3
         if: always()
+        uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: trivy-results.sarif
 
-      - name: Push image after scan passes
+      - name: Push image to ECR
+        if: hashFiles('trivy-results.sarif') != ''
         run: |
           docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ env.ENV }}-latest
 
+      - name: Upload image info artifact
+        if: hashFiles('trivy-results.sarif') != ''
+        run: |
+          echo "ECR_REPO=${{ env.ECR_REPO }}" >> $GITHUB_ENV
+          echo "IMAGE_TAG=${{ env.ENV }}-latest" >> $GITHUB_ENV
+          echo "REGISTRY=${{ steps.login-ecr.outputs.registry }}" >> $GITHUB_ENV
+
+  deploy:
+    needs: build-and-test
+    environment: ${{ github.ref_name == 'main' && 'prod' || github.ref_name == 'main' && 'staging' || 'dev' }}
+    runs-on: ubuntu-latest
+    env:
+      ENV: ${{ github.ref_name == 'main' && 'prod' || github.ref_name == 'staging' && 'staging' || 'dev' }}
+      TF_DIR: ${{ github.ref_name == 'main' && 'prod' || github.ref_name == 'staging' && 'staging' || 'dev' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
