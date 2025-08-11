@@ -56,17 +56,11 @@ jobs:
           public: true
 
       # Build locally first, scan, then push only if scan passes
-      - name: Compute image refs
-        id: refs
-        run: |
-          echo "IMAGE_URI=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}" >> "$GITHUB_ENV"
-          echo "FINAL_TAG=${{ env.ENV }}-latest" >> "$GITHUB_ENV"
-
       - name: Build image (no push)
         run: |
           docker buildx build \
             --platform linux/amd64 \
-            -t ${IMAGE_URI}:${FINAL_TAG} \
+            -t ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ env.ENV }}-latest \
             -f ${{ env.DOCKERFILE }} \
             --load .
 
@@ -74,7 +68,7 @@ jobs:
         uses: aquasecurity/trivy-action@0.20.0
         with:
           scan-type: image
-          image-ref: ${IMAGE_URI}:${FINAL_TAG}
+          image-ref: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ env.ENV }}-latest
           ignore-unfixed: true
           vuln-type: 'os,library'
           severity: 'CRITICAL,HIGH'
@@ -89,7 +83,7 @@ jobs:
 
       - name: Push image after scan passes
         run: |
-          docker push ${IMAGE_URI}:${FINAL_TAG}
+          docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ env.ENV }}-latest
 
 
       - name: Setup Terraform
