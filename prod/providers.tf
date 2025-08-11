@@ -6,6 +6,11 @@ terraform {
       version = "~> 5.0"
     }
   }
+  backend "s3" {
+    bucket = "terraform-tfstate-tset"
+    key    = "prod/terraform.tfstate"
+    region = "ap-northeast-1"
+  }
 }
 
 variable "aws_region" {
@@ -15,4 +20,4 @@ variable "aws_region" {
 
 provider "aws" {
   region = var.aws_region
-} 
+}
