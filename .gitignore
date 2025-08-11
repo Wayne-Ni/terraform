@@ -1,8 +1,9 @@
 # Terraform local state
 .terraform/
 **/.terraform/*
-terraform.tfstate
-terraform.tfstate.*
+**/terraform.tfstate
+**/terraform.tfstate.*
+**/.terraform/*
 crash.log
 
 # Local variable files (only ignore sensitive ones)
