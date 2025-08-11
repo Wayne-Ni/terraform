@@ -6,7 +6,7 @@ COPY main.go .
 RUN go build -o app main.go
 
 # Run stage
-FROM alpine:3.18
+FROM alpine:3.20
 WORKDIR /app
 COPY --from=builder /app/app .
 EXPOSE 8080
