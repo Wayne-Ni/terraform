@@ -1,7 +1,12 @@
+variable "vpc_id" {
+  description = "VPC id"
+  type        = string
+}
+
 resource "aws_security_group" "ecs" {
   name        = "ecs-sg"
   description = "Allow 8080 inbound"
-  vpc_id      = aws_vpc.main.id
+  vpc_id      = var.vpc_id
 
   ingress {
     from_port   = 8080
@@ -18,4 +23,6 @@ resource "aws_security_group" "ecs" {
   }
 }
 
-
+output "sg_id" {
+  value = aws_security_group.ecs.id
+} 

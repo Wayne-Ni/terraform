@@ -49,14 +49,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      # Optional: prepare toolchains for language builds outside Docker if needed
-      - name: Set up Java (Gradle projects)
-        if: hashFiles('**/build.gradle*') != ''
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '21'
-
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -87,7 +79,6 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Build and push Docker image
-        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -111,8 +102,14 @@ jobs:
         with:
           terraform_version: 1.7.5
 
+      - name: Terraform Init (local for dev)
+        if: matrix.env == 'dev'
+        working-directory: terraform/${{ matrix.tf_dir }}
+        run: terraform init -input=false -no-color
+
       - name: Terraform Init (S3 backend)
-        working-directory: terraform
+        if: matrix.env != 'dev'
+        working-directory: terraform/${{ matrix.tf_dir }}
         env:
           TF_BACKEND_BUCKET: ${{ secrets.TF_BACKEND_BUCKET }}
           TF_BACKEND_DDB_TABLE: ${{ secrets.TF_BACKEND_DDB_TABLE }}
@@ -123,107 +120,14 @@ jobs:
             -backend-config="region=${{ env.AWS_REGION }}" \
             -backend-config="dynamodb_table=${TF_BACKEND_DDB_TABLE}"
 
-      - name: Select/Create workspace
-        working-directory: terraform
-        run: |
-          terraform workspace select ${{ matrix.env }} 2>/dev/null || terraform workspace new ${{ matrix.env }}
-
       - name: Terraform Validate
-        working-directory: terraform
+        working-directory: terraform/${{ matrix.tf_dir }}
         run: terraform validate -no-color
 
       - name: Terraform Plan
-        working-directory: terraform
-        run: |
-          terraform plan -input=false -no-color \
-            -var="aws_region=${{ env.AWS_REGION }}" \
-            -var="ecr_repo_name=${{ matrix.ecr_repo }}" \
-            -var="ecs_cluster_name=${{ matrix.ecr_repo }}-cluster" \
-            -var="ecs_service_name=${{ matrix.ecr_repo }}-service" \
-            -var="image_tag=${{ steps.image.outputs.tag }}"
+        working-directory: terraform/${{ matrix.tf_dir }}
+        run: terraform plan -input=false -no-color -var="image_tag=${{ steps.image.outputs.tag }}"
 
       - name: Terraform Apply
-        working-directory: terraform
-        run: |
-          terraform apply -input=false -auto-approve -no-color \
-            -var="aws_region=${{ env.AWS_REGION }}" \
-            -var="ecr_repo_name=${{ matrix.ecr_repo }}" \
-            -var="ecs_cluster_name=${{ matrix.ecr_repo }}-cluster" \
-            -var="ecs_service_name=${{ matrix.ecr_repo }}-service" \
-            -var="image_tag=${{ steps.image.outputs.tag }}"
-
-name: CI/CD Pipeline for Golang on ECS
-
-on:
-  push:
-    branches:
-      - main
-      - develop
-      - 'feature/*'
-
-env:
-  AWS_REGION: ap-northeast-1
-  ECR_REPOSITORY: your-ecr-repo-name
-  ECS_CLUSTER: your-ecs-cluster
-  ECS_SERVICE: your-ecs-service
-  TF_WORKING_DIR: terraform
-
-jobs:
-  build-and-deploy:
-    runs-on: ubuntu-latest
-    env:
-      TF_WORKING_DIR: ${{ github.ref == 'refs/heads/main' && 'terraform/prod' || github.ref == 'refs/heads/develop' && 'terraform/staging' || startsWith(github.ref, 'refs/heads/feature/') && 'terraform/dev' || 'terraform/dev' }}
-      ECR_REPOSITORY: ${{ github.ref == 'refs/heads/main' && 'myapp-prod' || github.ref == 'refs/heads/develop' && 'myapp-staging' || startsWith(github.ref, 'refs/heads/feature/') && 'myapp-dev' || 'myapp-dev' }}
-      ECS_CLUSTER: ${{ github.ref == 'refs/heads/main' && 'myapp-prod-cluster' || github.ref == 'refs/heads/develop' && 'myapp-staging-cluster' || startsWith(github.ref, 'refs/heads/feature/') && 'myapp-dev-cluster' || 'myapp-dev-cluster' }}
-      ECS_SERVICE: ${{ github.ref == 'refs/heads/main' && 'myapp-prod-service' || github.ref == 'refs/heads/develop' && 'myapp-staging-service' || startsWith(github.ref, 'refs/heads/feature/') && 'myapp-dev-service' || 'myapp-dev-service' }}
-      AWS_REGION: ap-northeast-1
-
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-
-    - name: Set up Go
-      uses: actions/setup-go@v5
-      with:
-        go-version: '1.21'
-
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v3
-
-    - name: Configure AWS credentials
-      uses: aws-actions/configure-aws-credentials@v4
-      with:
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ${{ env.AWS_REGION }}
-
-    - name: Login to Amazon ECR
-      id: login-ecr
-      uses: aws-actions/amazon-ecr-login@v2
-
-    - name: Build, tag, and push Docker image to ECR
-      env:
-        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-        IMAGE_TAG: ${{ github.sha }}
-      run: |
-        docker build -t $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG .
-        docker push $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG
-
-    - name: Setup Terraform
-      uses: hashicorp/setup-terraform@v3
-
-    - name: Terraform Init
-      working-directory: ${{ env.TF_WORKING_DIR }}
-      run: terraform init
-
-    - name: Terraform Plan
-      working-directory: ${{ env.TF_WORKING_DIR }}
-      run: terraform plan -var="image_tag=${{ github.sha }}" -var="ecr_repo_name=${{ env.ECR_REPOSITORY }}" -var="ecs_cluster_name=${{ env.ECS_CLUSTER }}" -var="ecs_service_name=${{ env.ECS_SERVICE }}"
-
-    - name: Terraform Apply
-      working-directory: ${{ env.TF_WORKING_DIR }}
-      run: terraform apply -auto-approve -var="image_tag=${{ github.sha }}" -var="ecr_repo_name=${{ env.ECR_REPOSITORY }}" -var="ecs_cluster_name=${{ env.ECS_CLUSTER }}" -var="ecs_service_name=${{ env.ECS_SERVICE }}"
-      env:
-        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        AWS_REGION: ${{ env.AWS_REGION }} 
+        working-directory: terraform/${{ matrix.tf_dir }}
+        run: terraform apply -input=false -auto-approve -no-color -var="image_tag=${{ steps.image.outputs.tag }}" 
