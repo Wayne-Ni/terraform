@@ -1,0 +1,20 @@
+# Terraform local state
+.terraform/
+**/.terraform/*
+terraform.tfstate
+terraform.tfstate.*
+crash.log
+
+# Local variable files (only ignore sensitive ones)
+*.local.tfvars
+*secrets*.tfvars
+
+# Terraform backend local override
+terraform/backend.hcl
+
+# IDE
+.DS_Store
+.idea/
+.vscode/
+
+
