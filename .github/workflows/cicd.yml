@@ -78,6 +78,7 @@ jobs:
 
       - name: Upload Trivy SARIF to Code Scanning
         uses: github/codeql-action/upload-sarif@v3
+        if: always()
         with:
           sarif_file: trivy-results.sarif
 
