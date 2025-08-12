@@ -43,7 +43,10 @@
 - `.gitignore` 排除 `terraform.tfstate*`、`.terraform/`、`backend.hcl`
 - Go 程式碼若缺少必要環境變數（如 DB_PASSWORD）應直接 crash，方便偵錯
 - Go 以及 docker cache 加速
+---
 
+## 可選的修改
+- 改成 dev 打包 images , stage & prod 只拉取 dev ECR image 下來做 tag & push  不另外打包 ,除了可節省時間也確保版本一致性
 ---
 
 ## 參考指令
