@@ -6,11 +6,6 @@ on:
       - dev
       - staging
       - main
-  workflow_dispatch:
-
-permissions:
-  id-token: write
-  contents: read
 
 concurrency:
   group: cicd-${{ github.ref }}
@@ -18,19 +13,75 @@ concurrency:
 
 env:
   AWS_REGION: ap-northeast-1
-  DOCKERFILE: Dockerfile
+
+permissions:
+  contents: read
+  security-events: write
 
 jobs:
-  deploy:
+  build-and-test:
+    environment: ${{ github.ref_name == 'main' && 'prod' || github.ref_name == 'staging' && 'staging' || 'dev' }}
     runs-on: ubuntu-latest
     env:
-      ENV: ${{ github.ref_name == 'main' && 'prod' || github.ref_name == 'staging' && 'staging' || 'dev' }}
-      TF_DIR: ${{ github.ref_name == 'main' && 'prod' || github.ref_name == 'staging' && 'staging' || 'dev' }}
+      ENV: ${{ github.ref_name == 'main' && 'prod' || github.ref_name == 'staging' && 'staging' || 'dev' }} 
       ECR_REPO: ${{ github.ref_name == 'main' && 'myapp-prod' || github.ref_name == 'staging' && 'myapp-staging' || 'myapp-dev' }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Cache Go modules
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.24'
+          cache: true
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Verify dependencies
+        run: go mod verify
+
+      - name: Run tests
+        run: go test -v -race -coverprofile=coverage.out ./...
+
+      - name: Build Go binary
+        run: |
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -a -installsuffix cgo -o app .
+          echo "Binary size: $(ls -lh app)"
+
+      - name: Upload coverage reports
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./coverage.out
+          flags: unittests
+          name: codecov-umbrella
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - uses: int128/create-ecr-repository-action@v1
+        with:
+          repository: ${{ env.ECR_REPO }}
+          public: true
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -38,53 +89,80 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
+      - name: Cache Docker layers
+        uses: actions/cache@v3
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
-          aws-region: ${{ env.AWS_REGION }}
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-
 
-      - name: Login to Amazon ECR
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v2
-
-      - name: Ensure ECR repository exists
+      # Build Docker image using pre-built Go binary
+      - name: Build Docker image
         run: |
-          aws ecr describe-repositories --repository-names "$ECR_REPO" >/dev/null 2>&1 || \
-          aws ecr create-repository --repository-name "$ECR_REPO" >/dev/null
+          docker buildx build \
+            --platform linux/amd64 \
+            --cache-from type=local,src=/tmp/.buildx-cache \
+            --cache-to type=local,dest=/tmp/.buildx-cache,mode=max \
+            -t ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ env.ENV }}-latest \
+            -f Dockerfile \
+            --load .
 
-      - name: Extract Docker metadata
-        id: meta
-        uses: docker/metadata-action@v5
+      - name: Trivy scan (local image)
+        uses: aquasecurity/trivy-action@0.20.0
+        continue-on-error: true
         with:
-          images: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}
-          tags: |
-            type=sha,format=short,prefix=${{ env.ENV }}-
-            type=raw,value=${{ env.ENV }}-latest
+          scan-type: image
+          image-ref: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ env.ENV }}-latest
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '1'
+          format: sarif
+          output: trivy-results.sarif
 
-      - name: Build and push Docker image (multi-arch)
-        uses: docker/build-push-action@v6
+      - name: Upload Trivy SARIF to Code Scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
         with:
-          context: .
-          file: ${{ env.DOCKERFILE }}
-          push: true
-          platforms: linux/amd64,linux/arm64
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          sarif_file: trivy-results.sarif
 
-      - name: Set image tag output (env-shortsha)
-        id: image
+      - name: Push image to ECR
+        if: hashFiles('trivy-results.sarif') != ''
         run: |
-          SHORT_SHA="${GITHUB_SHA::7}"
-          echo "tag=${ENV}-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ env.ENV }}-latest
+
+      - name: Upload image info artifact
+        if: hashFiles('trivy-results.sarif') != ''
+        run: |
+          echo "ECR_REPO=${{ env.ECR_REPO }}" >> $GITHUB_ENV
+          echo "IMAGE_TAG=${{ env.ENV }}-latest" >> $GITHUB_ENV
+          echo "REGISTRY=${{ steps.login-ecr.outputs.registry }}" >> $GITHUB_ENV
+
+  deploy:
+    needs: build-and-test
+    environment: ${{ github.ref_name == 'main' && 'prod' || github.ref_name == 'main' && 'staging' || 'dev' }}
+    runs-on: ubuntu-latest
+    env:
+      ENV: ${{ github.ref_name == 'main' && 'prod' || github.ref_name == 'staging' && 'staging' || 'dev' }}
+      TF_DIR: ${{ github.ref_name == 'main' && 'prod' || github.ref_name == 'staging' && 'staging' || 'dev' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: 1.7.5
 
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}          
+  
       - name: Terraform Init
         working-directory: ${{ env.TF_DIR }}
         run: terraform init -input=false -no-color
@@ -100,171 +178,3 @@ jobs:
       - name: Terraform Apply
         working-directory: ${{ env.TF_DIR }}
         run: terraform apply -input=false -auto-approve -no-color
-name: CI/CD
-
-on:
-  push:
-    branches: [dev, staging, main]
-  workflow_dispatch:
-
-permissions:
-  id-token: write
-  contents: read
-
-concurrency:
-  group: cicd-${{ github.ref }}
-  cancel-in-progress: true
-
-env:
-  AWS_REGION: ap-northeast-1
-  DOCKERFILE: Dockerfile
-
-jobs:
-  deploy:
-    name: Deploy (${{ matrix.env }})
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - branch: dev
-            env: dev
-            tf_dir: dev
-            ecr_repo: myapp-dev
-            environment: dev
-          - branch: staging
-            env: staging
-            tf_dir: staging
-            ecr_repo: myapp-staging
-            environment: staging
-          - branch: main
-            env: prod
-            tf_dir: prod
-            ecr_repo: myapp-prod
-            environment: prod
-    environment: ${{ matrix.environment }}
-    env:
-      RUN_FOR_THIS_MATRIX: ${{ github.ref_name == matrix.branch }}
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      # Optional: prepare toolchains for language builds outside Docker if needed
-      - name: Set up Java (Gradle projects)
-        if: env.RUN_FOR_THIS_MATRIX == 'true' && hashFiles('**/build.gradle*') != ''
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '21'
-
-      - name: Configure AWS credentials (OIDC)
-        if: env.RUN_FOR_THIS_MATRIX == 'true'
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Login to Amazon ECR
-        id: login-ecr
-        if: env.RUN_FOR_THIS_MATRIX == 'true'
-        uses: aws-actions/amazon-ecr-login@v2
-
-      - name: Ensure ECR repository exists
-        env:
-          REPO: ${{ matrix.ecr_repo }}
-        if: env.RUN_FOR_THIS_MATRIX == 'true'
-        run: |
-          aws ecr describe-repositories --repository-names "$REPO" >/dev/null 2>&1 || \
-          aws ecr create-repository --repository-name "$REPO" >/dev/null
-
-      - name: Extract Docker metadata
-        id: meta
-        if: env.RUN_FOR_THIS_MATRIX == 'true'
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ steps.login-ecr.outputs.registry }}/${{ matrix.ecr_repo }}
-          tags: |
-            type=sha,format=short,prefix=${{ matrix.env }}-
-            type=raw,value=${{ matrix.env }}-latest
-
-      - name: Set up Docker Buildx
-        if: env.RUN_FOR_THIS_MATRIX == 'true'
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build and push Docker image
-        id: build
-        if: env.RUN_FOR_THIS_MATRIX == 'true'
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ${{ env.DOCKERFILE }}
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      - name: Set image tag output (env-shortsha)
-        id: image
-        if: env.RUN_FOR_THIS_MATRIX == 'true'
-        env:
-          ENV: ${{ matrix.env }}
-        run: |
-          SHORT_SHA="${GITHUB_SHA::7}"
-          echo "tag=${ENV}-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
-
-      - name: Setup Terraform
-        if: env.RUN_FOR_THIS_MATRIX == 'true'
-        uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: 1.7.5
-
-      - name: Terraform Init (S3 backend)
-        working-directory: terraform
-        if: env.RUN_FOR_THIS_MATRIX == 'true'
-        env:
-          TF_BACKEND_BUCKET: ${{ secrets.TF_BACKEND_BUCKET }}
-          TF_BACKEND_DDB_TABLE: ${{ secrets.TF_BACKEND_DDB_TABLE }}
-        run: |
-          terraform init -input=false -no-color \
-            -backend-config="bucket=${TF_BACKEND_BUCKET}" \
-            -backend-config="key=myapp/${{ matrix.env }}/terraform.tfstate" \
-            -backend-config="region=${{ env.AWS_REGION }}" \
-            -backend-config="dynamodb_table=${TF_BACKEND_DDB_TABLE}"
-
-      - name: Select/Create workspace
-        working-directory: terraform
-        if: env.RUN_FOR_THIS_MATRIX == 'true'
-        run: |
-          terraform workspace select ${{ matrix.env }} 2>/dev/null || terraform workspace new ${{ matrix.env }}
-
-      - name: Terraform Validate
-        working-directory: terraform
-        if: env.RUN_FOR_THIS_MATRIX == 'true'
-        run: terraform validate -no-color
-
-      - name: Terraform Plan
-        working-directory: terraform
-        if: env.RUN_FOR_THIS_MATRIX == 'true'
-        run: |
-          terraform plan -input=false -no-color \
-            -var="aws_region=${{ env.AWS_REGION }}" \
-            -var="ecr_repo_name=${{ matrix.ecr_repo }}" \
-            -var="ecs_cluster_name=${{ matrix.ecr_repo }}-cluster" \
-            -var="ecs_service_name=${{ matrix.ecr_repo }}-service" \
-            -var="image_tag=${{ steps.image.outputs.tag }}"
-
-      - name: Terraform Apply
-        working-directory: terraform
-        if: env.RUN_FOR_THIS_MATRIX == 'true'
-        run: |
-          terraform apply -input=false -auto-approve -no-color \
-            -var="aws_region=${{ env.AWS_REGION }}" \
-            -var="ecr_repo_name=${{ matrix.ecr_repo }}" \
-            -var="ecs_cluster_name=${{ matrix.ecr_repo }}-cluster" \
-            -var="ecs_service_name=${{ matrix.ecr_repo }}-service" \
-            -var="image_tag=${{ steps.image.outputs.tag }}"
-

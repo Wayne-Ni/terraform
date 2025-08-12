@@ -1,13 +1,19 @@
-# Build stage
-FROM golang:1.21-alpine AS builder
-WORKDIR /app
-COPY go.mod .
-COPY main.go .
-RUN go build -o app main.go
+# Multi-stage build using pre-built Go binary
+FROM alpine:3.20
 
-# Run stage
-FROM alpine:3.18
+# Install ca-certificates for HTTPS requests
+RUN apk --no-cache add ca-certificates
+
 WORKDIR /app
-COPY --from=builder /app/app .
+
+# Copy the pre-built Go binary from the build job
+COPY app .
+
+# Make the binary executable
+RUN chmod +x app
+
+# Expose port
 EXPOSE 8080
+
+# Run the binary
 CMD ["./app"] 
